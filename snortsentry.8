@@ -1,0 +1,205 @@
+.TH SNORTSENTRY 8 "December 1, 2025" "snortsentry v8.1.6" "General Commands Manual"
+.SH NAME
+snortsentry \- Snort alert processor and dynamic PF blocker for OpenBSD
+.SH SYNOPSIS
+.B snortsentry
+.RB [ \-a
+.I file
+.RB ] [ \-f
+.I file
+.RB ] [ \-l
+.I file
+.RB ] [ \-p
+.I file
+.RB ] [ \-s
+.I file
+.RB ] [ \-t
+.I table
+.RB ] [ \-Dhnv ] [ \-\-log
+.I file
+.RB ] [ \-\-status ] [ \-\-version ]
+.SH DESCRIPTION
+.B snortsentry
+is a highly resilient, Perl-based daemon that monitors Snort IDS alert logs
+and dynamically blocks offending source IP addresses using OpenBSD's Packet
+Filter (PF).
+
+It robustly parses Snort alerts, manages block duration escalation for repeat
+offenders, and uses **atomic file operations with checksums** for reliable
+state persistence across reboots. The program supports both **IPv4 and IPv6**
+addresses.
+
+.SH OPTIONS
+.TP
+.B \-f \fIfile\fP
+Specify configuration file (default: /etc/snort/snortsentry.conf).
+.TP
+.B \-a \fIfile\fP
+Specify Snort alert file (default: /var/log/snort/alert).
+.TP
+.B \-p \fIfile\fP
+Specify PID file (default: /var/run/snortsentry.pid).
+.TP
+.B \-l \fIfile\fP
+Specify lock file (default: /var/run/snortsentry.lock).
+.TP
+.B \-s \fIfile\fP
+Specify state file (default: /var/db/snortsentry.state).
+.TP
+.B \-\-log \fIfile\fP
+Specify log file (optional).
+.TP
+.B \-t \fItable\fP
+Specify PF table name (default: snort_block).
+.TP
+.B \-v
+Enable verbose (debug) logging.
+.TP
+.B \-D
+Run in foreground (don't daemonize).
+.TP
+.B \-n
+Dry run mode (parses alerts but does not modify PF).
+.TP
+.B \-h
+Show help message.
+.TP
+.B \-\-version
+Show version information.
+.TP
+.B \-\-status
+Show current running status. (Returns process ID if running).
+
+.SH CONFIGURATION
+The configuration file (default: /etc/snort/snortsentry.conf) supports the following options:
+
+.TP
+.B AlertFile \fIpath\fP
+Path to Snort alert file.
+.TP
+.B StateFile \fIpath\fP
+Path to state file for persistence.
+.TP
+.B BlockDuration \fIseconds\fP
+Initial block duration (default: 60).
+.TP
+.B MaxBlockDuration \fIseconds\fP
+Maximum block duration (default: 86400).
+.TP
+.B Priority \fInumber\fP
+Minimum alert priority to trigger blocking (1=highest, default: 1).
+.TP
+.B EnableEscalation \fIyes|no\fP
+Enable block duration escalation (default: yes).
+.TP
+.B EscalationTiers \fIseconds[,seconds...]\fP
+Comma-separated list of durations for subsequent blocks.
+.TP
+.B PfTable \fIname\fP
+PF table name (default: snort_block).
+.TP
+.B UseAnchor \fIyes|no\fP
+Toggles between Anchor Mode and Table Only Mode (default: yes).
+.TP
+.B AutoWhitelistRFC1918 \fIyes|no\fP
+Automatically whitelist RFC1918/link-local addresses (default: yes).
+.TP
+.B Keyword \fI"pattern"\fP
+Alert message patterns to match (case-insensitive regex).
+.TP
+.B Whitelist \fIip1 [ip2...]\fP
+IPs or CIDR blocks to whitelist.
+.TP
+.B CheckInterval \fIseconds\fP
+Alert file check interval (default: 1).
+.TP
+.B UnblockOnExit \fIyes|no\fP
+Remove all IPs from PF table on graceful exit (default: no).
+.TP
+.B LogLevel \fIdebug|info|warn|error\fP
+Log level (default: info).
+
+.SH PF SETUP
+.B snortsentry
+is optimized for stability using PF tables.
+
+.SS Table Only Mode (Recommended)
+This mode (\fBUseAnchor no\fP) requires the block rules to be manually defined in
+\fIpf.conf\fP. This prevents conflicts with other dynamically updated tables.
+
+.RS
+.nf
+table <snort_block> persist
+block drop quick from <snort_block> to any
+block drop quick inet6 from <snort_block> to any
+.fi
+.RE
+
+.SS Anchor Mode Caveat
+If \fBUseAnchor yes\fP (the default) is maintained, you must ensure your \fIpf.conf\fP
+loads the anchor (\fBanchor "snort_block" all\fP). This mode may lead to warnings
+or conflicts when other non-anchor tables are dynamically refreshed.
+
+.SH SERVICE MANAGEMENT
+The service is managed via \fBrcctl(8)\fP using the \fI/etc/rc.d/snortsentry\fP script.
+
+.TP
+Start service:
+.B rcctl start snortsentry
+.TP
+Reload configuration (sends SIGHUP):
+.B rcctl reload snortsentry
+.TP
+Check running status:
+.B rcctl check snortsentry
+.TP
+Manual process lookup:
+.B pgrep -f snortsentry
+
+.SH NOTES
+.TP
+.B NetAddr::IP Compatibility
+This version of snortsentry is designed for maximum compatibility with older
+OpenBSD systems running NetAddr::IP v3.x. Consequently, the optional feature to
+rewrite IPv4-mapped IPv6 addresses (::ffff:x.x.x.x) to pure IPv4 is disabled
+to ensure stability.
+
+.TP
+.B Permissions
+The daemon requires root privileges to execute \fBpfctl(8)\fP.
+
+.SH SIGNALS
+.TP
+.B SIGHUP
+Reload configuration from \fB\-f\fP file.
+.TP
+.B SIGTERM, SIGINT
+Graceful shutdown.
+.TP
+.B SIGUSR1
+Dump statistics to log.
+
+.SH FILES
+.TP
+.B /usr/local/sbin/snortsentry
+Main executable script.
+.TP
+.B /etc/snort/snortsentry.conf
+Default configuration file.
+.TP
+.B /var/db/snortsentry.state
+Default state file.
+.TP
+.B /etc/rc.d/snortsentry
+rcctl(8) control script.
+
+.SH EXAMPLES
+.TP
+Start in foreground with verbose logging:
+.B snortsentry -D -v -f /etc/snort/snortsentry.conf
+
+.SH SEE ALSO
+.BR pf.conf (5),
+.BR pfctl (8),
+.BR snort (8),
+.BR rcctl (8)

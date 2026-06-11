@@ -1,0 +1,2035 @@
+#!/usr/bin/perl -T
+#
+# snortsentry v8.1.7 - Snort/PF blocker for OpenBSD
+#
+# Configuration precedence is now CLI > Config File > Default.
+# FIXED: All CLI options are now defined in parse_pre_config_options to prevent 'Unknown option' error.
+# FIXED: The show_help subroutine was missing a closing brace.
+# FIXED: %alert_parsers is now declared 'our' to prevent 'will not stay shared' warning.
+# FIXED: CLI arguments are now saved before the first parser and re-fed to the second parser
+#        to correctly honor the -D/--no-daemon flag and prevent unintended daemonization.
+# FIXED: IPv4-mapped IPv6 address rewriting (::ffff:x.x.x.x -> x.x.x.x) now works correctly
+#        with NetAddr::IP v3.x using pure regex against the canonical addr string.
+#        RewriteMappedIPv4 is enabled by default. No NetAddr::IP v4.x dependency required.
+
+use strict ;
+use warnings ;
+use Getopt::Long ;
+use POSIX
+  qw(setsid strftime SIG_BLOCK SIG_UNBLOCK SIGHUP SIGINT SIGTERM) ;
+use File::Basename ;
+use File::Temp qw(tempfile) ;
+use File::Spec ;
+use Sys::Syslog qw(:standard :macros) ;
+use Fcntl       qw(:flock) ;
+use Digest::SHA qw(sha256_hex) ;
+use POSIX       qw(:signal_h) ;
+use Socket      qw(AF_INET AF_INET6) ;
+
+# Clean environment for taint mode
+delete @ENV{qw(IFS CDPATH ENV BASH_ENV PATH LOAD_LIBRARY)} ;
+$ENV{PATH} =
+  '/bin:/sbin:/usr/bin:/usr/sbin:/usr/local/bin:/usr/local/sbin' ;
+
+# Required modules
+# NetAddr::IP::Util and newer functions are avoided for compatibility with v3.x.
+foreach my $mod ( qw(NetAddr::IP JSON File::Temp) )
+{
+    eval "require $mod; $mod->import(); 1"
+      or die "ERROR: Module $mod required\n" ;
+    }
+
+our $VERSION = '8.1.7' ;
+
+# Default configuration with sensible defaults
+my %config = (config_file            => '/etc/snort/snortsentry.conf',
+              alert_file             => '/var/log/snort/alert',
+              pid_file               => '/var/run/snortsentry.pid',
+              lock_file              => '/var/run/snortsentry.lock',
+              state_file             => '/var/db/snortsentry.state',
+              log_file               => undef,
+              block_duration         => 60,
+              max_block_duration     => 86400,
+              priority               => 1,
+              keywords               => [],
+              whitelist              => [],
+              pf_table               => 'snort_block',
+              pf_anchor              => 'snort_block',
+              use_anchor             => 1,
+              daemon                 => 1,
+              log_level              => 'info',
+              and_prio_key           => 1,
+              check_interval         => 1,
+              batch_interval         => 5,
+              max_batch_size         => 100,
+              enable_escalation      => 1,
+              escalation_tiers       => [ 60, 300, 1800, 3600 ],
+              unblock_on_exit        => 0,
+              stats_interval         => 300,
+              auto_whitelist_rfc1918 => 1,
+              dry_run                => 0,
+              max_blocks             => 10000,
+              alert_format           => 'fast',
+              max_pf_retries         => 3,
+              rewrite_mapped_ipv4    => 1,
+              pf_retry_delay         => 1,
+              status_check           => 0,
+             ) ;
+
+# Global array to define which keys can be overridden by command line arguments.
+my @cli_keys = qw(
+  config_file alert_file pid_file lock_file state_file log_file
+  pf_table pf_anchor use_anchor
+  check_interval batch_interval priority block_duration max_block_duration
+  enable_escalation unblock_on_exit max_blocks log_level daemon dry_run
+) ;
+
+# Runtime state
+my %blocked_ips ;
+my %pending_blocks ;
+my %failed_blocks ;
+my $last_pos        = 0 ;
+my $last_inode      = 0 ;
+my $running         = 1 ;
+my $reload_config   = 0 ;
+my $dump_stats      = 0 ;
+my $last_batch_time = 0 ;
+my $last_stats_time = 0 ;
+my @whitelist_cidr ;
+my @keywords_regex ;
+my $LOCK_FH ;
+my $PID_FH ;
+my $cli_verbose = 0 ;
+my %log_levels  = ( debug => 0, info => 1, warn => 2, error => 3 ) ;
+
+# Declare %alert_parsers as 'our' to satisfy 'use strict' in a global scope
+our %alert_parsers = ( fast    => \&parse_fast_alert,
+                       unified => \&parse_unified_alert,
+                       json    => \&parse_json_alert,
+                     ) ;
+my %stats = ( alerts_processed => 0,
+              ips_blocked      => 0,
+              ips_unblocked    => 0,
+              blocks_extended  => 0,
+              whitelisted_hits => 0,
+              pf_failures      => 0,
+              started_at       => time()
+            ) ;
+
+# Signal handlers
+$SIG{TERM} = sub {
+    my $sigset = POSIX::SigSet->new( SIGTERM(), SIGINT(), SIGHUP() ) ;
+    POSIX::sigprocmask( SIG_BLOCK(), $sigset )
+      or log_msg( 'error', "sigprocmask failed on TERM: $!" ) ;
+    $running = 0 ;
+    POSIX::sigprocmask( SIG_UNBLOCK(), $sigset )
+      or log_msg( 'error', "sigprocmask failed on TERM unblock: $!" ) ;
+      } ;
+$SIG{INT} = $SIG{TERM} ;
+
+$SIG{HUP} = sub {
+    my $sigset = POSIX::SigSet->new( SIGTERM(), SIGINT(), SIGHUP() ) ;
+    POSIX::sigprocmask( SIG_BLOCK(), $sigset )
+      or log_msg( 'error', "sigprocmask failed on HUP: $!" ) ;
+    $reload_config = 1 ;
+    POSIX::sigprocmask( SIG_UNBLOCK(), $sigset )
+      or log_msg( 'error', "sigprocmask failed on HUP unblock: $!" ) ;
+      } ;
+
+$SIG{USR1} = sub {
+    my $sigset = POSIX::SigSet->new( SIGTERM(), SIGINT(), SIGHUP() ) ;
+    POSIX::sigprocmask( SIG_BLOCK(), $sigset )
+      or log_msg( 'error', "sigprocmask failed on USR1: $!" ) ;
+    $dump_stats = 1 ;
+    POSIX::sigprocmask( SIG_UNBLOCK(), $sigset )
+      or log_msg( 'error', "sigprocmask failed on USR1 unblock: $!" ) ;
+      } ;
+
+sub main
+{
+    # Store a copy of the initial default configuration settings.
+    my %initial_config = %config ;
+
+    # Save the original command line arguments for the second parsing pass.
+    # The first parser will consume flags, making them disappear from @ARGV.
+    my @original_argv = @ARGV ;
+
+    # Parse only the command-line options necessary to find the config file,
+    # and handle immediate exit options.
+    my %cli_temp ;
+    parse_pre_config_options( \%cli_temp ) ;
+
+    # Handle immediate exit flags using the default/CLI config path
+    if ( $cli_temp{version} )
+    {
+        print "snortsentry v$VERSION\n" ;
+        exit 0 ;
+        }
+    if ( $cli_temp{help} )
+    {
+        show_help() ;
+        exit 0 ;
+        }
+
+    # Check for status flag consumed in the first pass
+    if ( $cli_temp{status} )
+    {
+        $config{status_check} = 1 ;
+        }
+
+    # Apply the CLI-specified config file path (if provided)
+    if ( $cli_temp{config_file} )
+    {
+        $config{config_file} = $cli_temp{config_file} ;
+        }
+
+    # Load the configuration file (applies Config File > Default)
+    load_config() ;
+
+    # Parse ALL remaining CLI options and capture values that override the config file
+    # Pass the original arguments to the post-config parser
+    my %cli_final_overrides =
+      parse_post_config_options( \%initial_config, \@original_argv ) ;
+
+    # Re-apply CLI settings (CLI > Config File)
+    foreach my $key ( keys %cli_final_overrides )
+    {
+        $config{$key} = $cli_final_overrides{$key} ;
+        }
+
+    # Handle the verbose flag, giving it the highest precedence.
+    if ( $cli_verbose )
+    {
+        $config{log_level} = 'debug' ;
+        }
+
+    # Untaint ALL CLI-derived file paths (Required for -T mode)
+    # The variables are safe if they contain only standard path characters.
+    foreach my $file_key (
+                 qw(alert_file pid_file lock_file state_file log_file) )
+    {
+        if ( defined $config{$file_key} )
+        {
+            my $path = $config{$file_key} ;
+
+        # Check for alphanumeric, dashes, underscores, dots, and slashes
+            if ( $path =~ m{^([a-zA-Z0-9_\-\./]+)$} )
+            {
+                $config{$file_key} =
+                  $1 ;
+                }
+            else
+            {
+                die
+"Insecure path detected for $file_key (Taint Mode): $path\n"
+                  ;
+                }
+            }
+        }
+
+    # HANDLE STATUS CHECK HERE, AFTER CONFIG IS FULLY LOADED
+    if ( $config{status_check} )
+    {
+        show_status() ;
+        exit 0 ;
+        }
+
+    validate_config() ;
+    parse_whitelist() ;
+    preprocess_keywords() ;
+
+    # Validate and Initialize Configuratio
+    daemonize() if $config{daemon} ;
+    acquire_lock() ;
+    write_pid() ;
+
+    if ( $config{daemon} )
+    {
+        setup_syslog() ;
+        }
+    else
+    {
+        log_msg( 'info', "Running in foreground mode" ) ;
+        }
+
+    log_msg( 'info', "snortsentry v$VERSION started (PID $$)" ) ;
+
+    # IPv4-mapped IPv6 rewrite uses pure regex against the canonical addr
+    # string returned by NetAddr::IP->new()->addr, which is stable across
+    # all NetAddr::IP versions including v3.x. No v4.x methods are called.
+    log_msg( 'debug',
+"IPv4-mapped IPv6 rewrite: active (pure-regex, no NetAddr::IP v4.x required)"
+    ) ;
+
+    # Log based on anchor usage
+    if ( $config{use_anchor} )
+    {
+        log_msg(
+            'info',
+"Using PF anchor: $config{pf_anchor}, table: $config{pf_table}"
+        ) ;
+        }
+    else
+    {
+        log_msg(
+              'info',
+              "Using PF table only: $config{pf_table} (Anchor disabled)"
+        ) ;
+        log_msg(
+            'warn',
+"Table-Only Mode requires manual configuration of the blocking rule in /etc/pf.conf"
+        ) ;
+        }
+
+    setup_pf_anchor()
+      ;
+
+    if ( $config{dry_run} )
+    {
+        log_msg( 'warn', "DRY RUN: PF will not be modified" ) ;
+        }
+
+    load_state() ;
+    initialize_alert_tracking() ;
+
+    # Main loop
+    while ( $running )
+    {
+        my $now = time() ;
+
+        process_alerts() ;
+
+        if ( $now - $last_batch_time >= $config{batch_interval} )
+        {
+            apply_pending_blocks() ;
+            cleanup_expired() ;
+            $last_batch_time = $now ;
+            }
+
+        if ( keys %pending_blocks >= $config{max_batch_size} )
+        {
+            apply_pending_blocks() ;
+            $last_batch_time = $now ;
+            }
+
+        if ( $now - $last_stats_time >= $config{stats_interval} )
+        {
+            log_statistics() ;
+            $last_stats_time = $now ;
+            }
+
+        if ( $config{state_file} && ( $now % 60 ) == 0 )
+        {
+            save_state() ;
+            }
+
+        if ( $reload_config )
+        {
+            reload_config_safe() ;
+            $reload_config = 0 ;
+            }
+
+        if ( $dump_stats )
+        {
+            dump_statistics() ;
+            $dump_stats = 0 ;
+            }
+
+        sleep $config{check_interval} ;
+        }
+
+    cleanup() ;
+    log_msg( 'info', "snortsentry stopped" ) ;
+    exit 0 ;
+    }
+
+# Parse only the critical options needed to find the config file
+# and check for immediate exit flags (version/help/status).
+sub parse_pre_config_options
+{
+    my ( $cli_temp ) = @_ ;
+
+# Define throw-away variables to satisfy Getopt::Long that the options are known.
+    my $tmp_a ;
+    my $tmp_p ;
+    my $tmp_l ;
+    my $tmp_s ;
+    my $tmp_log ;
+    my $tmp_t ;
+    my $tmp_v ;
+    my $tmp_D ;
+    my $tmp_n ;
+
+    # Explicitly look for the config file, help, version, and status.
+    # The other options are listed to prevent 'Unknown option' error but are ignored.
+    GetOptions(
+        'f|config=s' => \$cli_temp->{config_file},
+        'a|alert=s'   => \$tmp_a,
+        'p|pid=s'     => \$tmp_p,
+        'l|lock=s'    => \$tmp_l,
+        's|state=s'   => \$tmp_s,
+        'log=s'       => \$tmp_log,
+        't|table=s'   => \$tmp_t,
+        'v|verbose'   => \$tmp_v,
+        'D|no-daemon' => \$tmp_D,
+        'n|dry-run'   => \$tmp_n,
+        'h|help'      => sub { $cli_temp->{help}    = 1 ; },
+        'version'     => sub { $cli_temp->{version} = 1 ; },
+        'status'      => sub { $cli_temp->{status}  = 1 ; },
+              )
+      or die "Error parsing options. Use -h for help.\n" ;
+    }
+
+# NEW SUBROUTINE: Parse ALL command line options after the config file has been loaded.
+# This captures only the values that were explicitly set to override the config file.
+sub parse_post_config_options
+{
+    my ( $initial_config, $args_ref ) = @_ ;
+    my %cli_overrides = () ;
+
+    # Restore @ARGV for this second parsing phase so all arguments are seen.
+    # Use 'local' to ensure @ARGV is restored after this subroutine exits.
+    local @ARGV = @$args_ref ;
+
+    # Use temporary variables here, which are then checked to see if the user specified them.
+    my $cli_alert_file ;
+    my $cli_pid_file ;
+    my $cli_lock_file ;
+    my $cli_state_file ;
+    my $cli_log_file ;
+    my $cli_pf_table ;
+    my $cli_daemon_off ;
+    my $cli_dry_run ;
+
+  # Explicitly list the options again, pointing to the temporary
+  # variables or the global state for flags like -v.
+    GetOptions(
+        'f|config=s' => \
+          my $cli_config_file,
+        'a|alert=s'   => \$cli_alert_file,
+        'p|pid=s'     => \$cli_pid_file,
+        'l|lock=s'    => \$cli_lock_file,
+        's|state=s'   => \$cli_state_file,
+        'log=s'       => \$cli_log_file,
+        't|table=s'   => \$cli_pf_table,
+        'v|verbose'   => \$cli_verbose,
+        'D|no-daemon' => \$cli_daemon_off,
+        'n|dry-run'   => \$cli_dry_run,
+        'h|help'      => sub { },
+        'version'     => sub { },
+        'status'      => sub { },
+              )
+      or die "Error parsing options. Use -h for help.\n" ;
+
+    # Now check if the temporary variables were actually set by the user
+    $cli_overrides{alert_file} = $cli_alert_file
+      if defined $cli_alert_file ;
+    $cli_overrides{pid_file}  = $cli_pid_file if defined $cli_pid_file ;
+    $cli_overrides{lock_file} = $cli_lock_file
+      if defined $cli_lock_file ;
+    $cli_overrides{state_file} = $cli_state_file
+      if defined $cli_state_file ;
+    $cli_overrides{log_file} = $cli_log_file if defined $cli_log_file ;
+    $cli_overrides{pf_table} = $cli_pf_table if defined $cli_pf_table ;
+
+    # Handle boolean flags that invert the default:
+    if ( defined $cli_daemon_off )
+    {
+        $cli_overrides{daemon} =
+          0 ;  # This is correctly set if -D was seen
+        }
+    if ( defined $cli_dry_run )
+    {
+        $cli_overrides{dry_run} = 1 ;
+        }
+
+  # Return the hash of only the overridden values
+  return %cli_overrides ;
+    }
+
+sub load_config
+{
+  return unless $config{config_file} && -f $config{config_file} ;
+
+    open my $cfh, '<', $config{config_file}
+      or die "Cannot open config file: $!" ;
+    my $lineno = 0 ;
+
+    # Reset keywords array to allow HUP to fully reload
+    $config{keywords} = [] ;
+
+    while ( my $line = <$cfh> )
+    {
+        $lineno++ ;
+        chomp $line ;
+        $line =~ s/#.*$// ;
+        $line =~ s/^\s+|\s+$//g ;
+      next unless length $line ;
+
+        if ( $line =~ /^AlertFile\s+(.+)$/i )
+        {
+            $config{alert_file} = $1 ;
+            }
+        elsif ( $line =~ /^PidFile\s+(.+)$/i )
+        {
+            $config{pid_file} = $1 ;
+            }
+        elsif ( $line =~ /^LockFile\s+(.+)$/i )
+        {
+            $config{lock_file} = $1 ;
+            }
+        elsif ( $line =~ /^StateFile\s+(.+)$/i )
+        {
+            $config{state_file} = $1 ;
+            }
+        elsif ( $line =~ /^LogFile\s+(.+)$/i )
+        {
+            $config{log_file} = $1 ;
+            }
+        elsif ( $line =~ /^BlockDuration\s+(\d+)$/i )
+        {
+            $config{block_duration} = $1 ;
+            }
+        elsif ( $line =~ /^MaxBlockDuration\s+(\d+)$/i )
+        {
+            $config{max_block_duration} = $1 ;
+            }
+        elsif ( $line =~ /^PfTable\s+(.+)$/i )
+        {
+            $config{pf_table} = $1 ;
+            }
+        elsif ( $line =~ /^PfAnchor\s+(.+)$/i )
+        {
+            $config{pf_anchor} = $1 ;
+            }  # NEW
+        elsif ( $line =~ /^UseAnchor\s+(yes|no|true|false|1|0)$/i )
+        {
+            $config{use_anchor} = parse_bool( $1 ) ;
+            }  # NEW
+        elsif ( $line =~ /^Priority\s+(\d+)$/i )
+        {
+            $config{priority} = $1 ;
+            }
+        elsif ( $line =~ /^LogLevel\s+(debug|info|warn|error)$/i )
+        {
+            $config{log_level} = lc $1 ;
+            }
+        elsif ( $line =~ /^CheckInterval\s+(\d+)$/i )
+        {
+            $config{check_interval} = $1 ;
+            }
+        elsif ( $line =~ /^BatchInterval\s+(\d+)$/i )
+        {
+            $config{batch_interval} = $1 ;
+            }
+        elsif (
+              $line =~ /^EnableEscalation\s+(yes|no|true|false|1|0)$/i )
+        {
+            $config{enable_escalation} = parse_bool( $1 ) ;
+            }
+        elsif ( $line =~ /^EscalationTiers\s+(.+)$/i )
+        {
+            my @t = split( /[,\s]+/, $1 ) ;
+            $config{escalation_tiers} = \@t ;
+            }
+        elsif ( $line =~ /^UnblockOnExit\s+(yes|no|true|false|1|0)$/i )
+        {
+            $config{unblock_on_exit} = parse_bool( $1 ) ;
+            }
+        elsif ( $line =~ /^StatsInterval\s+(\d+)$/i )
+        {
+            $config{stats_interval} = $1 ;
+            }
+        elsif ( $line =~
+                /^AutoWhitelistRFC1918\s+(yes|no|true|false|1|0)$/i )
+        {
+            $config{auto_whitelist_rfc1918} = parse_bool( $1 ) ;
+            }
+        elsif ( $line =~ /^MaxBlocks\s+(\d+)$/i )
+        {
+            $config{max_blocks} = $1 ;
+            }
+
+        # REVISED: Keyword is now a regex pattern string
+        elsif ( $line =~ /^Keyword\s+"([^"]+)"(?:\s+(.*))?$/i )
+        {
+            my ( $keyword, $rest ) = ( $1, $2 ) ;
+            push @{ $config{keywords} }, $keyword ;
+
+            if ( defined $rest )
+            {
+
+                # Process whitelist exclusions (e.g., !192.168.1.1)
+                while ( $rest =~ /(![\d\.:\/]+)/g )
+                {
+                    my $excluded = $1 ;
+                    $excluded =~ s/^!// ;
+                    if ( $excluded =~ /^[\d\.:\/]+$/ )
+                    {
+                        push @{ $config{whitelist} }, $excluded ;
+                        }
+                    else
+                    {
+                        log_msg(
+                            'warn',
+"invalid whitelist exclusion ignored: !$excluded"
+                        ) ;
+                        }
+                    }
+                }
+            }
+        elsif ( $line =~ /^Whitelist\s+(.+)$/i )
+        {
+            my @entries = split( /\s+/, $1 ) ;
+            foreach my $entry ( @entries )
+            {
+                if ( $entry =~ /^[\d\.:\/]+$/ )
+                {
+                    push @{ $config{whitelist} }, $entry ;
+                    }
+                else
+                {
+                    log_msg( 'warn',
+                             "invalid whitelist entry ignored: $entry"
+                           ) ;
+                    }
+                }
+            }
+        elsif ( $line =~ /^AlertFormat\s+(fast|unified2|json)$/i )
+        {
+            $config{alert_format} = lc $1 ;
+            }
+
+# RewriteMappedIPv4 rewrites ::ffff:x.x.x.x and ::x.x.x.x addresses to native
+# IPv4 before adding to the PF table. Implemented with pure regex against the
+# canonical addr string from NetAddr::IP->new()->addr — works correctly with
+# NetAddr::IP v3.x and later. Enabled by default.
+        elsif (
+             $line =~ /^RewriteMappedIPv4\s+(yes|no|true|false|1|0)$/i )
+        {
+            $config{rewrite_mapped_ipv4} = parse_bool( $1 ) ;
+            }
+        elsif ( $line =~ /^AndPrioKey\s+(yes|no|true|false|1|0)$/i )
+        {
+            $config{and_prio_key} = parse_bool( $1 ) ;
+            }
+        else
+        {
+            log_msg( 'debug',
+                     "Unknown directive at line $lineno: $line" ) ;
+            }
+        }
+    close $cfh ;
+    }
+
+sub validate_config
+{
+    # Verify required files
+    foreach my $req ( qw(alert_file pid_file lock_file state_file) )
+    {
+        unless ( $config{$req} )
+        {
+            die "Missing required config: $req\n" ;
+            }
+
+        my $dir = dirname( $config{$req} ) ;
+        unless ( -d $dir )
+        {
+            log_msg( 'info', "Creating directory $dir for $req" ) ;
+            my $mask = umask( 0 ) ;
+            mkdir( $dir, 0755 )
+              or die "Failed to create directory $dir: $!" ;
+            umask( $mask ) ;
+            }
+        }
+
+    unless ( -f $config{alert_file} )
+    {
+        die "AlertFile does not exist: $config{alert_file}\n" ;
+        }
+
+    # Validate escalation tiers
+    if ( $config{enable_escalation} )
+    {
+        my @tiers = @{ $config{escalation_tiers} } ;
+        for my $i ( 1 .. $#tiers )
+        {
+            die "Escalation tiers must be ascending\n"
+              if $tiers[ $i ] <= $tiers[ $i - 1 ] ;
+            }
+        }
+    }
+
+sub parse_bool
+{
+    my ( $val ) = @_ ;
+  return ( $val =~ /^(yes|true|1)$/i ) ? 1 : 0 ;
+    }
+
+sub parse_whitelist
+{
+    @whitelist_cidr = () ;
+
+    if ( $config{auto_whitelist_rfc1918} )
+    {
+        push @whitelist_cidr, (
+
+            # RFC1918 + loopback/link-local IPv4
+            NetAddr::IP->new( '127.0.0.0/8' ),
+            NetAddr::IP->new( '10.0.0.0/8' ),
+            NetAddr::IP->new( '172.16.0.0/12' ),
+            NetAddr::IP->new( '192.168.0.0/16' ),
+
+            # Loopback/link-local/unique-local IPv6
+            NetAddr::IP->new( '::1/128' ),
+            NetAddr::IP->new( 'fe80::/10' ),
+            NetAddr::IP->new( 'fc00::/7' ),
+        ) ;
+        }
+
+    foreach my $entry ( @{ $config{whitelist} || [] } )
+    {
+        if ( $entry =~ /^[\d\.:\/]+$/ )
+        {
+            my $cidr = eval { NetAddr::IP->new( $entry )  } ;
+            if ( $cidr )
+            {
+                push @whitelist_cidr, $cidr ;
+                log_msg( 'debug', "whitelist add: $entry" ) ;
+                }
+            else
+            {
+                log_msg( 'warn', "invalid whitelist entry: $entry" ) ;
+                }
+            }
+        else
+        {
+            log_msg( 'warn',
+                     "invalid (tainted) whitelist entry ignored: $entry"
+                   ) ;
+            }
+        }
+    }
+
+sub preprocess_keywords
+{
+
+    # Keywords are now treated as case-insensitive regex patterns
+    @keywords_regex = @{ $config{keywords} || [] } ;
+    }
+
+sub setup_syslog
+{
+    openlog( 'snortsentry', 'pid', 'daemon' ) ;
+    }
+
+sub log_msg
+{
+    my ( $level, $msg ) = @_ ;
+  return if $log_levels{$level} < $log_levels{ $config{log_level} } ;
+
+    my $ts   = strftime( "%Y-%m-%d %H:%M:%S", localtime() ) ;
+    my $line = "[$ts] [$level] $msg" ;
+
+    if ( $config{daemon} )
+    {
+        syslog(   $level eq 'error' ? LOG_ERR
+                : $level eq 'warn'  ? LOG_WARNING
+                : $level eq 'info'  ? LOG_INFO
+                : LOG_DEBUG,
+                "%s",
+                $line
+              ) ;
+        }
+    else
+    {
+        print STDERR "$line\n" ;
+        }
+
+    if ( $config{log_file} )
+    {
+        if ( open my $lf, '>>', $config{log_file} )
+        {
+            print $lf "$line\n" ;
+            close $lf ;
+            }
+        }
+    }
+
+sub initialize_alert_tracking
+{
+    my @st = stat( $config{alert_file} ) ;
+    $last_inode = $st[ 1 ] // 0 ;
+
+    if ( open my $fh, '<', $config{alert_file} )
+    {
+        if ( $last_pos == 0 )
+        {
+            seek( $fh, 0, 2 ) ;
+            $last_pos   = tell( $fh ) ;
+            $last_inode = ( stat( $fh ) )[ 1 ] // 0 ;
+            }
+        close $fh ;
+        }
+    }
+
+sub process_alerts
+{
+  return unless -f $config{alert_file} ;
+
+    my @st            = stat( $config{alert_file} ) ;
+    my $current_size  = $st[ 7 ] // 0 ;
+    my $current_inode = $st[ 1 ] // 0 ;
+
+    if ( $current_inode != $last_inode )
+    {
+        log_msg( 'info', "alert file rotated, resetting position" ) ;
+        $last_inode = $current_inode ;
+        $last_pos   = 0 ;
+        }
+
+    if ( $current_size < $last_pos )
+    {
+        log_msg( 'info',
+                 "alert file truncated, resetting position to 0" ) ;
+        $last_pos = 0 ;
+        }
+
+  return if $current_size <= $last_pos ;
+
+    open my $fh, '<', $config{alert_file} or do
+    {
+        log_msg( 'error', "open alert: $!" ) ;
+      return ;
+        } ;
+
+    unless ( seek( $fh, $last_pos, 0 ) )
+    {
+        log_msg(
+            'error',
+"seek failed to pos $last_pos: $!, aggressively resetting position"
+        ) ;
+        close $fh ;
+        $last_pos = $current_size ;
+      return ;
+        }
+
+    my $read_count = 0 ;
+    while ( my $line = <$fh> )
+    {
+        chomp $line ;
+        parse_alert( $line ) ;
+        $stats{alerts_processed}++ ;
+        $read_count++ ;
+        }
+
+    $last_pos = tell( $fh ) ;
+    close $fh ;
+
+    if ( $read_count > 0 )
+    {
+        log_msg( 'debug',
+                 "read $read_count new lines, last_pos now $last_pos"
+               ) ;
+        }
+    }
+
+sub parse_alert
+{
+    my ( $line ) = @_ ;
+    my $parser =
+      $alert_parsers{ $config{alert_format} } || \&parse_fast_alert ;
+    $parser->( $line ) ;
+    }
+
+sub parse_unified_alert
+{
+    log_msg(
+         'warn',
+         "Unified2 format not fully implemented in this script version."
+    ) ;
+  return ;
+    }
+
+sub parse_json_alert
+{
+    log_msg( 'warn',
+             "JSON format not fully implemented in this script version."
+           ) ;
+  return ;
+    }
+
+sub parse_fast_alert
+{
+    my ( $line ) = @_ ;
+  return unless defined $line ;
+
+    # Extract priority
+    my ( $priority ) = $line =~ /\[Priority:\s*(\d+)\]/ ;
+
+  # Block only if alert priority is less than or equal to configured max priority
+  return unless defined $priority && $priority <= $config{priority} ;
+
+    # Extract message
+    my ( $message ) =
+      $line =~ /\[\*\*\]\s*\[.*?\]\s*([^\[]+?)\s*\[\*\*\]/ ;
+  return unless defined $message ;
+    $message =~ s/^\s+|\s+$//g ;
+
+    # Keyword/Regex Matching (OPTIONAL)
+    # If keywords exist, they must match. If none exist, the alert passes.
+    if ( @keywords_regex )
+    {
+        my $found = 0 ;
+        foreach my $kw ( @keywords_regex )
+        {
+
+            # Keyword is now treated as a case-insensitive regex pattern
+            if ( $message =~ /$kw/i )
+            {
+                $found = 1 ;
+              last ;
+                }
+            }
+      return unless $found ;
+        }
+
+    # Extract source IP field
+    my $src_field ;
+    if ( $line =~ /\}\s*(.+?)\s*->/ )
+    {
+        $src_field = $1 ;
+        }
+    elsif ( $line =~ /\}(.+?)(?:\s+|$)/ )
+    {
+        $src_field = $1 ;
+        }
+    else
+    {
+      return ;
+        }
+
+    $src_field =~ s/^\s+|\s+$//g ;
+
+    # Extract the raw IP string (without port)
+    my $raw_ip_str = extract_raw_ip_string( $src_field ) ;
+    unless ( defined $raw_ip_str )
+    {
+        log_msg( 'debug',
+                 "failed to extract IP string from: '$src_field'" ) ;
+      return ;
+        }
+
+    # Normalize and validate using NetAddr::IP
+    my $ipobj = normalize_ip( $raw_ip_str ) ;
+    unless ( $ipobj )
+    {
+        log_msg( 'debug',
+                 "invalid or unnormalizeable IP: $raw_ip_str" ) ;
+      return ;
+        }
+
+    # Whitelist check
+    if ( is_whitelisted( $ipobj ) )
+    {
+        $stats{whitelisted_hits}++ ;
+        log_msg( 'debug',
+                 "whitelisted: " . $ipobj->addr . " - $message" ) ;
+      return ;
+        }
+
+    # Use the safe function for final IP string extraction
+    queue_block( normalize_ip_for_pf( $ipobj ),
+                 sanitize_string( $message ) ) ;
+    }
+
+sub extract_raw_ip_string
+{
+    my ( $field ) = @_ ;
+  return unless defined $field ;
+    $field =~ s/^\s+|\s+$//g ;
+
+    # Bracketed IPv6 (with optional port). Captures content inside brackets.
+    if ( $field =~ /^\[([^\]]+)\](?::\d+)?/ )
+    {
+      return $1 ;
+        }
+
+    # Standard IPv4, IPv4-mapped IPv6, or unbracketed IPv6 ending in :port.
+    elsif ( $field =~ /^(.+):(\d{1,5})$/ )
+    {
+      return $1 ;
+        }
+
+    # Match an address that has no port number (pure IP string).
+    elsif ( $field =~ /^([\d\.:a-fA-F%]+)$/ )
+    {
+      return $1 ;
+        }
+
+  return undef ;
+    }
+
+sub normalize_ip
+{
+    my ( $raw_ip_str ) = @_ ;
+  return unless defined $raw_ip_str ;
+
+    # Strip the IPv6 Zone Index (e.g., %eth0)
+    my $ip_for_netaddr = $raw_ip_str ;
+    $ip_for_netaddr =~ s/%.*$// ;
+
+   # Use NetAddr::IP for robust validation and canonicalization
+   # This relies only on NetAddr::IP->new() which is stable across versions.
+    my $ipobj = eval { NetAddr::IP->new( $ip_for_netaddr )  } ;
+
+    unless ( $ipobj )
+    {
+      return undef ;
+        }
+
+  # Avoid calling NetAddr::IP->is_v4_mapped() or ->ipv4_mapped() here for compatibility.
+  # Return the validated and canonical IP object
+  return $ipobj ;
+    }
+
+sub normalize_ip_for_pf
+{
+    my ( $ipobj ) = @_ ;
+  return unless $ipobj ;
+
+    # Rewrite IPv4-mapped and IPv4-compatible IPv6 addresses to native IPv4
+    # before adding to the PF table. A native IPv4 block is effective against
+    # IPv4 traffic; an ::ffff:x.x.x.x entry in the IPv6 table is not.
+    #
+    # Implementation: pure regex against the canonical string returned by
+    # NetAddr::IP->new()->addr. That method is stable across all NetAddr::IP
+    # versions including v3.x. No v4.x-only methods (is_v4_mapped,
+    # ipv4_mapped) are called anywhere in this function.
+    #
+    # Three forms handled:
+    #   ::ffff:d.d.d.d        dotted-decimal mapped  (most common from Snort)
+    #   ::ffff:hhhh:hhhh      hex-word mapped        (NetAddr::IP v3.x canonical form)
+    #   ::d.d.d.d             IPv4-compatible        (deprecated RFC 4291 s2.5.5.1)
+
+    if ( $config{rewrite_mapped_ipv4} )
+    {
+        my $addr = $ipobj->addr ;
+
+        # Dotted-decimal form: ::ffff:d.d.d.d
+        if ( $addr =~ /^::ffff:(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})$/i )
+        {
+            log_msg( 'debug', "rewrite mapped IPv4: $addr -> $1" ) ;
+          return $1 ;
+            }
+
+        # Hex-word form: ::ffff:hhhh:hhhh
+        # NetAddr::IP v3.x canonicalises ::ffff:192.0.2.1 as ::ffff:c000:201
+        # so this branch handles what v3.x actually produces for mapped addresses.
+        if ( $addr =~ /^::ffff:([0-9a-f]{1,4}):([0-9a-f]{1,4})$/i )
+        {
+            my ( $hi, $lo ) = ( hex($1), hex($2) ) ;
+            my $ipv4 = sprintf( "%d.%d.%d.%d",
+                $hi >> 8,  $hi & 0xff,
+                $lo >> 8,  $lo & 0xff ) ;
+            log_msg( 'debug', "rewrite mapped IPv4 (hex): $addr -> $ipv4" ) ;
+          return $ipv4 ;
+            }
+
+        # IPv4-compatible (deprecated): ::d.d.d.d
+        if ( $addr =~ /^::(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})$/i )
+        {
+            log_msg( 'debug', "rewrite compat IPv4: $addr -> $1" ) ;
+          return $1 ;
+            }
+    }
+
+  return $ipobj->addr ;
+    }
+
+sub is_whitelisted
+{
+    my ( $ipobj ) = @_ ;
+  return unless $ipobj ;
+
+    foreach my $cidr ( @whitelist_cidr )
+    {
+      return 1 if $ipobj->within( $cidr ) ;
+        }
+
+  return 0 ;
+    }
+
+sub queue_block
+{
+    my ( $ip, $reason ) = @_ ;
+  return unless $ip ;
+
+    my $now = time() ;
+
+    if ( exists $blocked_ips{$ip} )
+    {
+        my $tier = $blocked_ips{$ip}{tier} // 0 ;
+        if (    $config{enable_escalation}
+             && $tier < $#{ $config{escalation_tiers} } )
+        {
+            $tier++ ;
+            }
+        my $duration =
+            $config{enable_escalation}
+          ? $config{escalation_tiers}[ $tier ]
+          : $config{block_duration} ;
+        $duration = $config{max_block_duration}
+          if $duration > $config{max_block_duration} ;
+
+        $blocked_ips{$ip}{expires} = $now + $duration ;
+        $blocked_ips{$ip}{count}++ ;
+        $blocked_ips{$ip}{last_seen}   = $now ;
+        $blocked_ips{$ip}{tier}        = $tier ;
+        $blocked_ips{$ip}{last_reason} = $reason ;
+
+        $stats{blocks_extended}++ ;
+        log_msg( 'debug',
+                 "extended $ip tier $tier expires in $duration s" ) ;
+        }
+    else
+    {
+        if ( keys %blocked_ips >= $config{max_blocks} )
+        {
+            log_msg( 'warn', "max blocks reached, skipping $ip" ) ;
+          return ;
+            }
+
+        my $duration = $config{block_duration} ;
+        $blocked_ips{$ip} = {
+                              first_seen  => $now,
+                              last_seen   => $now,
+                              count       => 1,
+                              expires     => $now + $duration,
+                              tier        => 0,
+                              last_reason => $reason
+                            } ;
+        $pending_blocks{$ip} = $reason ;
+        log_msg( 'info',
+                 "queued block $ip for $duration s - $reason" ) ;
+        }
+    }
+
+# Helper to build the optional anchor argument for pfctl
+sub get_pfctl_anchor_arg
+{
+
+  # Return the -a 'anchor_name' part only if use_anchor is enabled
+  return $config{use_anchor}
+      ? " -a " . escape_shell( $config{pf_anchor} )
+      : "" ;
+    }
+
+sub apply_pending_blocks
+{
+    my @valid_ips = grep {
+
+        # Minimal check for valid PF input format
+        $_ =~ /^[\d\.:a-fA-F\/]+$/ && NetAddr::IP->new( $_ )
+        } keys %pending_blocks ;
+
+  return unless @valid_ips ;
+
+    log_msg( 'info',
+             "applying " . scalar( @valid_ips ) . " pending blocks" ) ;
+
+    unless ( $config{dry_run} )
+    {
+        my ( $tfh, $tmp ) = tempfile() ;
+        print $tfh "$_\n" for @valid_ips ;
+        close $tfh ;
+
+        # Use dynamic anchor argument
+        my $cmd = "pfctl"
+          . get_pfctl_anchor_arg() . " -t "
+          . escape_shell( $config{pf_table} )
+          . " -T add -f "
+          . escape_shell( $tmp )
+          . " 2>&1" ;
+
+        my $success = run_pfctl( $cmd ) ;
+
+        if ( $success )
+        {
+            $stats{ips_blocked} += scalar @valid_ips ;
+            delete @pending_blocks{@valid_ips} ;
+            }
+        else
+        {
+            $stats{pf_failures} += scalar @valid_ips ;
+            foreach my $ip ( @valid_ips )
+            {
+                $failed_blocks{$ip} = ( $failed_blocks{$ip} || 0 ) + 1 ;
+                }
+            }
+
+        unlink $tmp ;
+        }
+    else
+    {
+        foreach my $ip ( @valid_ips )
+        {
+            log_msg( 'info',
+                     "[DRY RUN] would add $ip - $pending_blocks{$ip}"
+                   ) ;
+            }
+        $stats{ips_blocked} += scalar @valid_ips ;
+        %pending_blocks = () ;
+        }
+    }
+
+sub cleanup_expired
+{
+    my $now = time() ;
+    my @expired =
+      grep { $blocked_ips{$_}{expires} <= $now } keys %blocked_ips ;
+  return unless @expired ;
+
+    log_msg( 'info',
+             "removing " . scalar( @expired ) . " expired entries" ) ;
+
+    unless ( $config{dry_run} )
+    {
+        my ( $tfh, $tmp ) = tempfile() ;
+        print $tfh "$_\n" for @expired ;
+        close $tfh ;
+
+        # Use dynamic anchor argument
+        my $cmd = "pfctl"
+          . get_pfctl_anchor_arg() . " -t "
+          . escape_shell( $config{pf_table} )
+          . " -T delete -f "
+          . escape_shell( $tmp )
+          . " 2>&1" ;
+
+        my $success = run_pfctl( $cmd ) ;
+
+        if ( $success )
+        {
+            delete @blocked_ips{@expired} ;
+            $stats{ips_unblocked} += scalar @expired ;
+            }
+        else
+        {
+            $stats{pf_failures} += scalar @expired ;
+            log_msg( 'error',
+                     "failed to remove expired blocks, will retry" ) ;
+            }
+
+        unlink $tmp ;
+        }
+    else
+    {
+        foreach my $ip ( @expired )
+        {
+            log_msg( 'info', "[DRY RUN] would remove $ip" ) ;
+            }
+        delete @blocked_ips{@expired} ;
+        $stats{ips_unblocked} += scalar @expired ;
+        }
+    }
+
+sub run_pfctl
+{
+    my ( $cmd ) = @_ ;
+    my $max_retries = $config{max_pf_retries} ;
+
+    for my $attempt ( 1 .. $max_retries )
+    {
+        my $out = qx($cmd) ;
+        my $rc  = $? >> 8 ;
+
+        if ( $rc == 0 && $out !~ /fail|error|invalid|cannot|bad/i )
+        {
+          return 1 ;
+            }
+
+        log_msg( 'warn',
+                 "pfctl attempt $attempt failed (rc=$rc): $out" ) ;
+        sleep $config{pf_retry_delay} if $attempt < $max_retries ;
+        }
+
+  return 0 ;
+    }
+
+sub save_state
+{
+  return unless $config{state_file} ;
+
+    my $state_dir = dirname( $config{state_file} ) ;
+    unless ( -d $state_dir )
+    {
+        my $mask = umask( 0 ) ;
+        mkdir( $state_dir, 0755 )
+          or die "Failed to create state directory $state_dir: $!" ;
+        umask( $mask ) ;
+        }
+
+    my ( $tfh, $tmp ) = tempfile() ;
+    my $abs_tmp = File::Spec->rel2abs( $tmp ) ;
+
+    my @lines = ( "# snortsentry state v$VERSION" ) ;
+
+    foreach my $ip ( sort keys %blocked_ips )
+    {
+        my $h = $blocked_ips{$ip} ;
+        push @lines,
+          join( '|',
+                $ip,
+                $h->{first_seen} // 0,
+                $h->{last_seen}  // 0,
+                $h->{count}      // 0,
+                $h->{expires}    // 0,
+                $h->{tier}       // 0,
+                ( sanitize_string( $h->{last_reason} ) // '' ) ) ;
+        }
+
+    my $payload = join( "\n", @lines ) . "\n" ;
+    $payload =~ s/\r\n/\n/g ;
+    my $checksum = sha256_hex( $payload ) ;
+
+    print $tfh "# CHECKSUM: $checksum\n$payload" ;
+    close $tfh ;
+
+    unless ( rename $abs_tmp, $config{state_file} )
+    {
+        log_msg( 'error', "rename state tmp failed: $!" ) ;
+        unlink $abs_tmp ;
+      return ;
+        }
+
+    log_msg( 'debug',
+                    "state saved ("
+                  . scalar( keys %blocked_ips )
+                  . " entries)" ) ;
+    }
+
+sub load_state
+{
+  return unless $config{state_file} && -f $config{state_file} ;
+
+    open my $sfh, '<', $config{state_file} or do
+    {
+        log_msg( 'error', "cannot open state: $!" ) ;
+      return ;
+        } ;
+
+    my $checksum_line = <$sfh> ;
+    my ( $stored )    = $checksum_line =~ /CHECKSUM:\s*(\S+)/ ;
+    my $payload       = do { local $/ ; <$sfh>  } ;
+    close $sfh ;
+
+    unless ( defined $stored && defined $payload )
+    {
+        log_msg( 'error', "state file corrupted; ignoring state" ) ;
+      return ;
+        }
+
+    my $computed = sha256_hex( $payload ) ;
+    unless ( defined $stored && $stored eq $computed )
+    {
+        log_msg( 'error', "state checksum mismatch; ignoring state" ) ;
+      return ;
+        }
+
+    my $loaded = 0 ;
+    while ( $payload =~
+            /^([^|\n]+)\|(\d+)\|(\d+)\|(\d+)\|(\d+)\|(\d+)\|(.*)$/mg )
+    {
+        my ( $ip, $first, $last, $count, $expires, $tier, $reason ) =
+          ( $1, $2, $3, $4, $5, $6, $7 ) ;
+      next unless $ip ;
+      next if $expires <= time() ;
+
+        unless ( $ip =~ /^[\d\.:a-fA-F\/]+$/
+                 && NetAddr::IP->new( $ip ) )
+        {
+            log_msg( 'warn', "invalid IP found in state file: $ip" ) ;
+          next ;
+            }
+
+        $blocked_ips{$ip} = {
+                              first_seen  => $first,
+                              last_seen   => $last,
+                              count       => $count,
+                              expires     => $expires,
+                              tier        => $tier,
+                              last_reason => $reason
+                            } ;
+        $pending_blocks{$ip} = "restored" ;
+        $loaded++ ;
+        }
+
+    log_msg( 'info', "state loaded: $loaded entries restored" ) ;
+    }
+
+sub setup_pf_anchor
+{
+
+  # Guard anchor setup with the config setting
+  return unless $config{use_anchor} ;
+  return if $config{dry_run} ;
+
+    my $anchor_name = escape_shell( $config{pf_anchor} ) ;
+    my $table_name  = escape_shell( $config{pf_table} ) ;
+
+    my $cmd = "pfctl -a $anchor_name -sr 2>&1" ;
+    my $out = qx($cmd) ;
+    my $rc  = $? >> 8 ;
+
+    if ( $rc != 0 && $out =~ /Anchor.*does not exist|does not exist/i )
+    {
+        log_msg( 'info',
+                 "anchor $config{pf_anchor} does not exist, creating it"
+               ) ;
+
+        my ( $fh, $tmp ) = tempfile() ;
+
+        # Use configurable names
+        print $fh "anchor \"$config{pf_anchor}\" {\n" ;
+        print $fh
+          "    block drop quick from <$config{pf_table}> to any\n" ;
+        print $fh "}\n" ;
+        close $fh ;
+
+        my $cmd2 = "pfctl -f " . escape_shell( $tmp ) . " 2>&1" ;
+        my $o    = qx($cmd2) ;
+        my $r    = $? >> 8 ;
+
+        unlink $tmp ;
+
+        if ( $r != 0 || $o =~ /fail|error|invalid/i )
+        {
+            log_msg( 'error', "failed to create anchor: $o" ) ;
+            die "Cannot create anchor $config{pf_anchor}\n" ;
+            }
+        }
+
+    # Initialize table to ensure it exists within the anchor scope (if using anchor)
+    my $anchor_arg = get_pfctl_anchor_arg() ;
+    my $cmd3 =
+        "pfctl"
+      . $anchor_arg . " -t "
+      . $table_name
+      . " -T add 0.0.0.0 2>&1" ;
+    my $o2 = qx($cmd3) ;
+    my $r2 = $? >> 8 ;
+
+    if ( $r2 != 0 || $o2 =~ /fail|error|invalid/i )
+    {
+        log_msg( 'error', "failed to initialize anchor table: $o2" ) ;
+        }
+
+    # Clean up dummy entry
+    my $cmd4 =
+        "pfctl"
+      . $anchor_arg . " -t "
+      . $table_name
+      . " -T delete 0.0.0.0 2>&1" ;
+    qx($cmd4) ;
+
+    log_msg(
+        'info',
+"anchor $config{pf_anchor} initialized with table $config{pf_table}"
+    ) ;
+    }
+
+sub daemonize
+{
+    chdir '/' or die "Cannot chdir to /: $!" ;
+
+    open STDIN, '<', '/dev/null' or die "Cannot read /dev/null: $!" ;
+
+    if ( $config{log_file} )
+    {
+        eval {
+            open STDOUT, '>>', $config{log_file} or die $! ;
+            open STDERR, '>&STDOUT' or die $! ;
+            } ;
+        if ( $@ )
+        {
+            open STDOUT, '>', '/dev/null' or die $! ;
+            open STDERR, '>&STDOUT' or die $! ;
+            }
+        }
+    else
+    {
+        open STDOUT, '>', '/dev/null' or die $! ;
+        open STDERR, '>&STDOUT' or die $! ;
+        }
+
+    defined( my $pid = fork ) or die "Cannot fork: $!" ;
+    exit if $pid ;
+
+    setsid() or die "Cannot start a new session: $!" ;
+
+    $pid = fork ;
+    exit if $pid ;
+
+    umask 027 ;
+    }
+
+sub acquire_lock
+{
+    my $lock_dir = dirname( $config{lock_file} ) ;
+    unless ( -d $lock_dir )
+    {
+        my $mask = umask( 0 ) ;
+        mkdir( $lock_dir, 0755 )
+          or die "Failed to create lock directory $lock_dir: $!" ;
+        umask( $mask ) ;
+        }
+
+    open $LOCK_FH, '>>', $config{lock_file}
+      or die "Cannot open lock file $config{lock_file}: $!" ;
+
+    unless ( flock( $LOCK_FH, LOCK_EX | LOCK_NB ) )
+    {
+        log_msg( 'warn',
+                 "Lock file exists. Checking for stale PID..." ) ;
+
+        my $pid ;
+        if ( -f $config{pid_file} )
+        {
+            open my $pfh, '<', $config{pid_file} or do
+            {
+                log_msg( 'warn', "Cannot read PID file: $!" ) ;
+                } ;
+            $pid = <$pfh> ;
+            chomp $pid ;
+            close $pfh ;
+            }
+
+        if ( $pid )
+        {
+            my $safe_pid ;
+            if ( $pid =~ /^(\d+)$/ )
+            {
+                $safe_pid = $1 ;
+                }
+            if ( $safe_pid && kill 0, $safe_pid )
+            {
+                die
+"Another instance is running (PID $safe_pid) (lock $config{lock_file})\n"
+                  ;
+                }
+            }
+        else
+        {
+            log_msg(
+                'info',
+"Stale PID/lock found (PID: $pid), removing and retrying lock."
+            ) ;
+
+            close $LOCK_FH ;
+            unlink $config{lock_file} if -f $config{lock_file} ;
+            unlink $config{pid_file}  if -f $config{pid_file} ;
+
+            open $LOCK_FH, '>>', $config{lock_file}
+              or die "Cannot re-open lock file: $!" ;
+            flock( $LOCK_FH, LOCK_EX | LOCK_NB )
+              or die "Failed to acquire lock after cleanup.\n" ;
+
+            log_msg(
+                'info',
+                "Successfully acquired lock after cleaning stale files."
+            ) ;
+            }
+        }
+    }
+
+sub write_pid
+{
+    my $pid_dir = dirname( $config{pid_file} ) ;
+    unless ( -d $pid_dir )
+    {
+        my $mask = umask( 0 ) ;
+        mkdir( $pid_dir, 0755 )
+          or die "Failed to create pid directory $pid_dir: $!" ;
+        umask( $mask ) ;
+        }
+
+    open $PID_FH, '>', $config{pid_file}
+      or die "Cannot write PID file $config{pid_file}: $!" ;
+    flock( $PID_FH, LOCK_EX | LOCK_NB )
+      or die "Cannot lock PID file $config{pid_file}: $!" ;
+
+    # Use select and $|=1 to ensure the PID is written and flushed immediately
+    # after daemonization, preventing a buffering issue that caused blank PID files.
+    my $old_fh = select $PID_FH ;
+    $| = 1 ;
+    print $PID_FH $$, "\n" ;
+    select $old_fh ;
+
+    # $PID_FH remains open and locked until the process exits (in sub cleanup)
+    }
+
+sub reload_config_safe
+{
+    my %old_config         = %config ;
+    my %old_blocked_ips    = %blocked_ips ;
+    my @old_whitelist_cidr = @whitelist_cidr ;
+    my @old_keywords_regex = @keywords_regex ;
+    my %old_pending_blocks = %pending_blocks ;
+    my %old_failed_blocks  = %failed_blocks ;
+    my $old_cli_verbose    = $cli_verbose ;
+
+    eval {
+        load_config() ;
+
+    # If the -v flag was used on startup, it must override config file log_level on HUP.
+        if ( $cli_verbose )
+        {
+            $config{log_level} = 'debug' ;
+            }
+
+        validate_config() ;
+        parse_whitelist() ;
+        preprocess_keywords() ;
+        } ;
+
+    if ( $@ )
+    {
+        log_msg( 'error', "Config reload failed: $@. Rolling back." ) ;
+        %config         = %old_config ;
+        %blocked_ips    = %old_blocked_ips ;
+        @whitelist_cidr = @old_whitelist_cidr ;
+        @keywords_regex = @old_keywords_regex ;
+        %pending_blocks = %old_pending_blocks ;
+        %failed_blocks  = %old_failed_blocks ;
+        $cli_verbose    = $old_cli_verbose ;
+        }
+    else
+    {
+        log_msg( 'info', "Config reloaded successfully" ) ;
+        log_msg( 'debug',
+"IPv4-mapped IPv6 rewrite: active (pure-regex, no NetAddr::IP v4.x required)"
+        ) ;
+
+        # Log anchor status after reload
+        if ( $config{use_anchor} )
+        {
+            log_msg(
+                'info',
+"New PF config: anchor $config{pf_anchor}, table $config{pf_table}"
+            ) ;
+            setup_pf_anchor() ;
+            }
+        else
+        {
+            log_msg(
+                'info',
+"New PF config: table $config{pf_table} (Anchor disabled)"
+            ) ;
+            }
+        }
+    }
+
+sub escape_shell
+{
+    my ( $s ) = @_ ;
+    $s =~ s/'/'"'"'/g ;
+  return "'$s'" ;
+    }
+
+sub sanitize_string
+{
+    my ( $s ) = @_ ;
+  return '' unless defined $s ;
+    $s =~ s/[^[:print:]]//g ;
+    $s =~ s/[";|&\$`<>\n\r]/_/g ;
+  return substr( $s, 0, 255 ) ;
+    }
+
+sub show_status
+{
+    my $pf = $config{pid_file} ;
+    if ( -f $pf )
+    {
+        open my $p, '<', $pf or die "Cannot open pid file: $!" ;
+        my $pid = <$p> ;
+        chomp $pid ;
+        close $p ;
+
+        # Untaint the PID read from the file before using it in the kill function.
+        my $safe_pid ;
+        if ( $pid =~ /^(\d+)$/ )
+        {
+            $safe_pid = $1 ;
+            }
+
+        if ( $safe_pid && kill 0, $safe_pid )
+        {
+            print "snortsentry running (PID $safe_pid)\n" ;
+            exit 0 ;
+            }
+        else
+        {
+            print "stale pid file found (PID $pid), not running\n" ;
+            exit 1 ;
+            }
+        }
+    else
+    {
+        print "not running\n" ;
+        exit 1 ;
+        }
+    }
+
+sub dump_statistics
+{
+    log_msg( 'info', "=== STATISTICS ===" ) ;
+    log_msg( 'info',
+             "Uptime: " . ( time() - $stats{started_at} ) . "s" ) ;
+    log_msg( 'info', "Alerts processed: $stats{alerts_processed}" ) ;
+    log_msg( 'info', "IPs blocked: $stats{ips_blocked}" ) ;
+    log_msg( 'info', "IPs unblocked: $stats{ips_unblocked}" ) ;
+    log_msg( 'info', "Blocks extended: $stats{blocks_extended}" ) ;
+    log_msg( 'info', "Whitelisted hits: $stats{whitelisted_hits}" ) ;
+    log_msg( 'info', "PF failures: $stats{pf_failures}" ) ;
+    log_msg( 'info',
+             "Currently blocking: " . scalar( keys %blocked_ips ) ) ;
+
+    if ( %blocked_ips )
+    {
+        log_msg( 'info', "Top 10 offenders:" ) ;
+        my @sorted =
+          sort { $blocked_ips{$b}{count} <=> $blocked_ips{$a}{count} }
+          keys %blocked_ips ;
+        my $count = 0 ;
+        foreach my $ip ( @sorted )
+        {
+          last if ++$count > 10 ;
+            my $info      = $blocked_ips{$ip} ;
+            my $time_left = $info->{expires} - time() ;
+            log_msg(
+                'info',
+                sprintf(
+"  %s: %d alerts, tier %d, expires in %ds. Last reason: %s",
+                    $ip, $info->{count},
+                    $info->{tier} || 0,
+                    $time_left > 0 ? $time_left : 0,
+                    $info->{last_reason}
+                )
+            ) ;
+            }
+        }
+    }
+
+sub log_statistics
+{
+    my $uptime        = time() - $stats{started_at} ;
+    my $blocked_count = scalar( keys %blocked_ips ) ;
+    log_msg(
+        'info',
+        sprintf(
+"Stats: uptime=%ds, alerts=%d, blocked=%d, active=%d, extended=%d, unblocked=%d, pf_failures=%d",
+            $uptime,                 $stats{alerts_processed},
+            $stats{ips_blocked},     $blocked_count,
+            $stats{blocks_extended}, $stats{ips_unblocked},
+            $stats{pf_failures}
+        )
+    ) ;
+    }
+
+sub cleanup
+{
+    log_msg( 'info',
+             "cleanup: applying pending blocks and saving state" ) ;
+
+    apply_pending_blocks() if %pending_blocks ;
+    save_state()           if $config{state_file} ;
+
+    if ( $config{unblock_on_exit} )
+    {
+        my @ips = keys %blocked_ips ;
+        if ( @ips && !$config{dry_run} )
+        {
+            my ( $tfh, $tmp ) = tempfile() ;
+            print $tfh "$_\n" for @ips ;
+            close $tfh ;
+
+            # Use dynamic anchor argument
+            my $cmd = "pfctl"
+              . get_pfctl_anchor_arg() . " -t "
+              . escape_shell( $config{pf_table} )
+              . " -T delete -f "
+              . escape_shell( $tmp )
+              . " 2>&1" ;
+
+            my $out = qx($cmd) ;
+            my $rc  = $? >> 8 ;
+
+            if ( $rc != 0 || $out =~ /fail|error|invalid/i )
+            {
+                log_msg( 'error',
+                         "pfctl unblock on exit failed: $out" ) ;
+                }
+
+            unlink $tmp ;
+            }
+        }
+
+    if ( $PID_FH )
+    {
+        close $PID_FH ;
+        unlink $config{pid_file} if -f $config{pid_file} ;
+        }
+
+    if ( $LOCK_FH )
+    {
+        flock( $LOCK_FH, LOCK_UN ) ;
+        close $LOCK_FH ;
+        if ( !-f $config{pid_file} )
+        {
+            unlink $config{lock_file} if -f $config{lock_file} ;
+            }
+        }
+
+    closelog() if $config{daemon} ;
+    }
+
+sub show_help
+{
+    my $width   = 80 ;
+    my $pad     = 14 ;
+    my $VERSION = $VERSION ;
+
+    # justify a single paragraph of plain words to $width columns
+    sub justify_paragraph
+    {
+        my ( $text, $w ) = @_ ;
+        $w //= 80 ;
+        $text =~ s/\s+/ /g ;
+        $text =~ s/^\s+|\s+$//g ;
+      return '' if $text eq '' ;
+
+        my @words = split / /, $text ;
+        my @lines ;
+        my $line = shift @words ;
+
+        while ( @words )
+        {
+            if ( length( $line ) + 1 + length( $words[ 0 ] ) <= $w )
+            {
+                $line .= ' ' . shift @words ;
+                }
+            else
+            {
+                push @lines, $line ;
+                $line = shift @words ;
+                }
+            }
+        push @lines, $line if defined $line ;
+
+        # justify all but the last line
+        for my $i ( 0 .. $#lines - 1 )
+        {
+            my $ln = $lines[ $i ] ;
+          next if $ln =~ /^\s*$/ ;
+            my @ws = split / /, $ln ;
+            my $total_chars = 0 ;
+            $total_chars += length( $_ ) for @ws ;
+            my $spaces_needed = $w - $total_chars ;
+            my $slots         = ( @ws - 1 ) || 1 ;
+            my $min_space     = int( $spaces_needed / $slots ) ;
+            my $extra         = $spaces_needed % $slots ;
+
+            my $just = shift @ws ;
+            for my $s ( 0 .. $slots - 1 )
+            {
+                my $sp = $min_space + ( $s < $extra ? 1 : 0 ) ;
+                $just .= ( ' ' x $sp ) . ( $ws[ $s ] // '' ) ;
+                }
+            $lines[ $i ] = $just ;
+            }
+
+        # the last line: left-align (no full justification)
+        $lines[ -1 ] .= ' ' x ( $w - length( $lines[ -1 ] ) )
+          if length( $lines[ -1 ] ) < $w ;
+
+      return join( "\n", @lines ) ;
+        }
+
+    # wrap & justify a description that starts at column $pad (so effective width is $width - $pad)
+    sub justify_description
+    {
+        my ( $desc, $pad, $width ) = @_ ;
+        $width //= 80 ;
+        my $eff = $width - $pad ;
+        $desc =~ s/^\s+|\s+$//g ;
+      return '' if $desc eq '' ;
+
+        # split into words and build lines of length <= $eff
+        my @words = split /\s+/, $desc ;
+        my @lines ;
+        my $line = shift @words // '' ;
+        while ( @words )
+        {
+            if ( length( $line ) + 1 + length( $words[ 0 ] ) <= $eff )
+            {
+                $line .= ' ' . shift @words ;
+                }
+            else
+            {
+                push @lines, $line ;
+                $line = shift @words ;
+                }
+            }
+        push @lines, $line if defined $line ;
+
+        # justify all but the last line
+        for my $i ( 0 .. $#lines - 1 )
+        {
+            my $ln = $lines[ $i ] ;
+          next if $ln =~ /^\s*$/ ;
+            my @ws = split / /, $ln ;
+            my $total_chars = 0 ;
+            $total_chars += length( $_ ) for @ws ;
+            my $spaces_needed = $eff - $total_chars ;
+            my $slots         = ( @ws - 1 ) || 1 ;
+            my $min_space     = int( $spaces_needed / $slots ) ;
+            my $extra         = $spaces_needed % $slots ;
+
+            my $just = shift @ws ;
+            for my $s ( 0 .. $slots - 1 )
+            {
+                my $sp = $min_space + ( $s < $extra ? 1 : 0 ) ;
+                $just .= ( ' ' x $sp ) . ( $ws[ $s ] // '' ) ;
+                }
+            $lines[ $i ] = $just ;
+            }
+
+        # last line left-aligned (no fill)
+        $lines[ -1 ] .= ' ' x ( $eff - length( $lines[ -1 ] ) )
+          if length( $lines[ -1 ] ) < $eff ;
+
+        # prefix the first line with spaces so option label fits, subsequent lines padded to $pad
+        my $out = sprintf( "%${pad}s", '' ) . shift( @lines ) . "\n" ;
+        $out .= ( sprintf( "%${pad}s", '' ) . $_ . "\n" ) for @lines ;
+        chomp $out ;
+      return $out ;
+        }
+
+    # build the help content in logical paragraphs
+    my @out ;
+
+    push @out,
+      justify_paragraph(
+                       "snortsentry v$VERSION - Snort-based PF blocker",
+                       $width ) ;
+    push @out, '' ;
+
+    push @out, justify_paragraph( "Usage: $0 [OPTIONS]", $width ) ;
+    push @out, '' ;
+
+    # Options block: label padded, description wrapped & justified
+    my @options = (
+            [ '-f FILE',
+              'Config file (default: /etc/snort/snortsentry.conf)'
+            ],
+            [ '-a FILE', 'Alert file (default: /var/log/snort/alert)' ],
+            [ '-p FILE', 'PID file (default: /var/run/snortsentry.pid)'
+            ],
+            [ '-l FILE',
+              'Lock file (default: /var/run/snortsentry.lock)'
+            ],
+            [ '-s FILE',
+              'State file (default: /var/db/snortsentry.state)'
+            ],
+            [ '--log FILE', 'Log file (optional)' ],
+            [ '-t NAME',    'PF table (default: snort_block)' ],
+            [ '-v',         'Verbose (debug logging)' ],
+            [ '-D',         'No daemon' ],
+            [ '-n',         'Dry run' ],
+            [ '--version',  'Show version' ],
+            [ '--status',   'Show current status' ],
+            [ '-h',         'Help' ],
+    ) ;
+
+    for my $opt ( @options )
+    {
+        my ( $label, $desc ) = @$opt ;
+        my $label_padded   = sprintf( "%-${pad}s", $label ) ;
+        my $first_line_len = $pad ;
+
+        # If description is short, place it on same line; else call justify_description
+        if ( length( $desc ) <= ( $width - $pad ) )
+        {
+            push @out, $label_padded . $desc ;
+            }
+        else
+        {
+            push @out,
+              $label_padded
+              . substr( justify_description( $desc, $pad, $width ),
+                        $pad ) ;
+            }
+        }
+
+    push @out, '' ;
+    push @out,
+      justify_paragraph( "Configuration Directives (snortsentry.conf):",
+                         $width ) ;
+    push @out, '' ;
+
+    push @out,
+      sprintf( "%-20s : %s",
+             "PfTable NAME",
+             "PF table name to store blocked IPs (Default: snort_block)"
+      ) ;
+    push @out,
+      sprintf( "%-20s : %s",
+               "PfAnchor NAME",
+               "PF anchor name (Default: snort_block)" ) ;
+    push @out,
+      sprintf( "%-20s : %s",
+               "UseAnchor [yes|no]",
+               "Enable/disable the anchor creation logic (Default: yes)"
+             ) ;
+    push @out, '' ;
+
+    push @out, justify_paragraph( "PF Configuration Modes:", $width ) ;
+    push @out, '' ;
+
+    push @out,
+      justify_paragraph(
+"1. Table + Anchor Mode (UseAnchor yes): The script creates and manages both the anchor and the table. The anchor contains the blocking rule (block drop quick from <PfTable> to any). REQUIREMENT: Your main pf.conf must load this anchor (e.g., anchor \"snort_block\" all).",
+        $width
+      ) ;
+    push @out, '' ;
+    push @out,
+      justify_paragraph(
+"2. Table Only Mode (UseAnchor no): The script ONLY manages the IP addresses in the PF table (PfTable). REQUIREMENT: You MUST manually define the blocking rule in your main pf.conf: table <PfTable> persist; block drop quick from <PfTable> to any",
+        $width
+      ) ;
+    push @out, '' ;
+
+    push @out,
+      justify_paragraph(
+"Features: Priority-based Blocking (Default): Blocks any alert at or below the configured Priority (default 1) if no Keywords are set. Optional Regex Filtering: If Keywords are set, they act as case-insensitive regex patterns against the alert message. Atomic state file operations with checksum verification. Configurable block duration escalation.",
+        $width
+      ) ;
+    push @out, '' ;
+
+    push @out,
+      justify_paragraph(
+"NOTE: IPv4-mapped IPv6 address rewriting (RewriteMappedIPv4) is enabled by default and implemented using pure regex matching against the canonical address string produced by NetAddr::IP->new()->addr. This approach works correctly with NetAddr::IP v3.x and later without requiring any v4.x-specific methods.",
+        $width
+      ) ;
+
+    # print everything
+    my $text = join( "\n", @out ) ;
+    $text =~ s/^/  /mg ;
+    print $text, "\n" ;
+
+    exit 0 ;
+    }
+
+main() unless caller ;
+1 ;
